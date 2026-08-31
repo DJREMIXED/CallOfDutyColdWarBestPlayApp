@@ -1,4 +1,4 @@
-# Fan Cave Studio PRO — Clip Toolkit
+# Fan Cave Studio PRO — Clip Trimming Toolkit
 
 **Batch-trim and organise *Call of Duty: Black Ops Cold War* gameplay captures on macOS.**
 
@@ -57,16 +57,21 @@ installed system-wide.
 
 ## Install
 
-### 1. Get the two files
+### 1. Get the files
 
 Download these into a folder of your own — Desktop, Documents, wherever:
 
 - `build_mac_studio.command`
 - `fan_cave_studio.py`
+- `requirements.txt`
+- `requirements-build.txt`
 
-Either clone the repo, or use **Code → Download ZIP**, or open each file and hit the
-**Download raw file** button. Keep both files **in the same folder** — the builder looks for
-the Python file next to itself.
+Easiest is to clone the repo or use **Code → Download ZIP**, which gets all four at once.
+Keep them **in the same folder** — the builder looks for the others next to itself.
+
+The two `requirements` files pin every package to a known-good version, so a build today
+installs exactly what a build last month installed. If you'd rather build against the
+newest releases of everything, run the builder with `--latest` and the pins are ignored.
 
 ```bash
 mkdir -p ~/Desktop/FCSP
@@ -344,7 +349,7 @@ No bundled OCR engine and no OpenCV — both jobs go through frameworks already 
 You don't have to build the `.app` at all:
 
 ```bash
-pip3 install numpy pyobjc-framework-Vision pyobjc-framework-Quartz
+pip3 install -r requirements.txt
 python3 fan_cave_studio.py
 ```
 
@@ -372,6 +377,18 @@ it would probably start on Windows or Linux with Tesseract installed and softwar
 but none of that is tested and there's no build script for it. Pull requests welcome.
 
 ---
+
+## Contributing
+
+Bug reports and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for what
+gets accepted, how to run the tests, and what I look at during review. Open an issue before
+starting anything large.
+
+## Security
+
+The app makes no network connections, collects nothing, and never needs `sudo`.
+[SECURITY.md](SECURITY.md) spells out exactly what it does and doesn't do on your machine,
+how to check the build script before you run it, and how to report a problem privately.
 
 ## License
 
