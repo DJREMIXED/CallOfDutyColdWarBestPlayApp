@@ -1,5 +1,12 @@
 # Fan Cave Studio PRO — Clip Toolkit
 
+<img width="1244" height="860" alt="Screenshot 2026-08-30 at 8 41 07 PM" src="https://github.com/user-attachments/assets/7ba638bc-1282-47fc-92fb-361b8efa9663" />
+
+<img width="1236" height="857" alt="Screenshot 2026-08-30 at 8 41 35 PM" src="https://github.com/user-attachments/assets/c6182b7a-1c30-4bf1-b4cb-7a65db5376ac" />
+
+<img width="1241" height="859" alt="Screenshot 2026-08-30 at 8 42 04 PM" src="https://github.com/user-attachments/assets/daf80aa5-2ebf-45f7-84c5-fbadd67e15f4" />
+
+
 **Batch-trim and organise *Call of Duty: Black Ops Cold War* gameplay captures on macOS.**
 
 ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
