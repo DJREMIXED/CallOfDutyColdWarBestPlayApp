@@ -57,6 +57,7 @@ import json
 import os
 import platform
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -70,6 +71,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 APP_NAME = "Fan Cave Studio PRO — Clip Toolkit"
+APP_VERSION = "1.2.0"
+SUPPORT_EMAIL = "djremixed@icloud.com"
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".m2ts",
               ".flv", ".wmv"}
 IS_MAC = platform.system() == "Darwin"
@@ -122,6 +125,24 @@ FZ_DEFAULTS = {
     "preview": True,          # summary popup before anything is written
     "in_folder": "",
     "out_folder": "",
+    "ignore_region": "None",  # part of the screen to leave out of the comparison
+    "manual_end": False,      # advanced: hand-pick the end of clips with no freeze
+    "manual_shots": 4,        # snapshots per second in the review strip
+    "manual_span": 10.0,      # seconds of clip per batch of snapshots
+    "manual_width": 190,      # review thumbnail width
+}
+
+# Parts of the screen that can be left out of the freeze comparison, as
+# x1, y1, x2, y2 fractions. A permanently-animated overlay in one corner (a
+# gamertag, a mic icon, a killfeed) otherwise keeps a still screen from ever
+# counting as frozen.
+IGNORE_REGIONS = {
+    "None": None,
+    "Top-right corner": (0.70, 0.00, 1.00, 0.18),
+    "Top-left corner": (0.00, 0.00, 0.30, 0.18),
+    "Top strip": (0.00, 0.00, 1.00, 0.16),
+    "Bottom strip": (0.00, 0.84, 1.00, 1.00),
+    "Both top corners": [(0.70, 0.00, 1.00, 0.18), (0.00, 0.00, 0.30, 0.18)],
 }
 
 # ---- Map Sorter tab -------------------------------------------------------
@@ -150,14 +171,24 @@ MAP_DEFAULTS = {
     "maps": "Amsterdam, Game Show, Gluboko, ICBM, KGB, Mansion, Showroom, U-Bahn",
     "auto": True,             # run the scoreboard-reading stage first
     "region": DEFAULT_MAP_REGION,
-    "interval": 0.7,          # seconds between OCR samples in stage 1
+    "interval": 0.35,         # seconds between OCR samples in stage 1
     "min_hits": 2,            # frames a map name must read on before it counts
     "snaps": 5,               # snapshots per clip for manual review
     "spread": SPREAD_MODES[0],
     "snap_interval": 3.0,     # gap between snapshots in "First seconds" mode
     "snap_width": 230,
     "threads": 0,             # 0 = auto
+    "custom_region": "6, 10, 45, 18",   # x1, y1, x2, y2 as % of the frame
+    # --- recognising the map by how it looks (see MAP RECOGNITION below) ---
+    "recognize": True,        # suggest a map during manual review
+    "ref_root": "",           # folder holding the already-sorted map subfolders
+    "ref_frames": 4,          # frames sampled from each reference clip
+    "ref_max_clips": 80,      # cap on reference clips per map
+    "query_frames": 12,       # frames sampled from a clip being identified
+    "knn": 7,                 # neighbours consulted per query frame
+    "ref_width": 320,         # width frames are scaled to before embedding
 }
+CUSTOM_REGION = "Custom…"
 
 
 # --------------------------------------------------------------------------- #
@@ -299,6 +330,90 @@ def strip_hwaccel(cmd):
             continue
         out.append(c)
     return out
+
+
+TEMP_PREFIXES = ("bestplay_", "mapsort_", "fcstudio_")
+
+
+def dir_size(path):
+    total = 0
+    try:
+        for p in Path(path).rglob("*"):
+            if p.is_file():
+                total += p.stat().st_size
+    except Exception:
+        pass
+    return total
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def find_junk(folders, include_snap_cache=True):
+    """Scratch left behind by a run: temp dirs, half-written trims, snapshot caches.
+
+    Never returns a video the user asked for, an original, or an output file.
+    """
+    found = []
+    seen = set()
+
+    def add(p):
+        p = Path(p)
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen or not p.exists():
+            return
+        seen.add(key)
+        found.append({"path": p, "kind": "folder" if p.is_dir() else "file",
+                      "bytes": dir_size(p) if p.is_dir() else p.stat().st_size})
+
+    for folder in folders:
+        if not folder:
+            continue
+        folder = Path(folder)
+        if not folder.is_dir():
+            continue
+        for stray in folder.glob("__trimtmp__*"):
+            add(stray)
+        if include_snap_cache:
+            for cache in folder.glob(SNAP_PREFIX + "*"):
+                if cache.is_dir():
+                    add(cache)
+        for sub in folder.iterdir():          # one level down: per-map folders
+            if sub.is_dir() and not sub.name.startswith("."):
+                for stray in sub.glob("__trimtmp__*"):
+                    add(stray)
+
+    tmp_root = Path(tempfile.gettempdir())
+    try:
+        for d in tmp_root.iterdir():
+            if d.is_dir() and d.name.startswith(TEMP_PREFIXES):
+                add(d)
+    except Exception:
+        pass
+    return found
+
+
+def remove_junk(items):
+    """Delete what find_junk turned up. Returns (removed, bytes, failures)."""
+    removed = freed = 0
+    failures = []
+    for item in items:
+        p = Path(item["path"])
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed += 1
+            freed += item.get("bytes", 0)
+        except Exception as ex:
+            failures.append(f"{p.name}: {ex}")
+    return removed, freed, failures
 
 
 def open_in_finder(path):
@@ -443,21 +558,23 @@ def crop_filter(region):
             f"scale={SCAN_W}:-2")
 
 
-def extract_frames(video, start, duration, fps, vf, out_dir, ffmpeg):
-    """Write sampled JPEGs for [start, start+duration). Returns [(time, path)].
+def extract_frames(video, start, duration, fps, vf, out_dir, ffmpeg, ext="jpg"):
+    """Write sampled frames for [start, start+duration). Returns [(time, path)].
 
     Decoding runs through VideoToolbox on Apple Silicon, with a one-shot
-    software retry for files the hardware decoder refuses.
+    software retry for files the hardware decoder refuses. `ext` is "jpg" for
+    OCR work and "png" when tkinter has to display the result — tk.PhotoImage
+    cannot read JPEG.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("f_*.jpg"):
+    for old in out_dir.glob(f"f_*.{ext}"):
         old.unlink()
+    quality = ["-q:v", "4"] if ext == "jpg" else []
     cmd = ([ffmpeg, "-hide_banner", "-v", "error", "-nostdin"] + hwaccel_args()
            + ["-ss", f"{start:.3f}", "-i", str(video), "-t", f"{duration:.3f}",
-              "-vf", f"fps={fps},{vf}",
-              "-q:v", "4", "-an", "-sn", "-threads", "0",
-              str(out_dir / "f_%06d.jpg")])
+              "-vf", f"fps={fps},{vf}"] + quality
+           + ["-an", "-sn", "-threads", "0", str(out_dir / f"f_%06d.{ext}")])
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
@@ -468,7 +585,7 @@ def extract_frames(video, start, duration, fps, vf, out_dir, ffmpeg):
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except subprocess.CalledProcessError:
             return []
-    frames = sorted(out_dir.glob("f_*.jpg"))
+    frames = sorted(out_dir.glob(f"f_*.{ext}"))
     return [(start + i / fps, p) for i, p in enumerate(frames)]
 
 
@@ -750,22 +867,44 @@ def sample_gray(video, start, duration, interval, width, dims, ffmpeg, cancel):
             proc.wait()
 
 
+def ignore_mask(np, shape, region):
+    """Boolean array of the pixels to COUNT, or None when everything counts."""
+    rects = IGNORE_REGIONS.get(region)
+    if not rects:
+        return None
+    if isinstance(rects, tuple):
+        rects = [rects]
+    h, w = shape
+    mask = np.ones(shape, dtype=bool)
+    for x1, y1, x2, y2 in rects:
+        mask[int(y1 * h):max(1, int(y2 * h)), int(x1 * w):max(1, int(x2 * w))] = False
+    return mask if mask.any() else None
+
+
 def scan_range(video, start, duration, s, dims, ffmpeg, cancel):
     """Return (time of the last sample that differed from its predecessor, last time)."""
     np = _numpy()
     max_frac = 1.0 - float(s["unchanged_pct"]) / 100.0
     tol = int(s["pixel_tol"])
     prev = None
+    mask = None
+    counted = 0
     last_change = None
     last_t = start
     for t, cur in sample_gray(video, start, duration, float(s["sample_interval"]),
                               int(s["sample_width"]), dims, ffmpeg, cancel):
         last_t = t
+        if mask is None and counted == 0:
+            mask = ignore_mask(np, cur.shape, s.get("ignore_region", "None"))
+            counted = int(mask.sum()) if mask is not None else cur.size
         if prev is not None:
-            # same maths as the original: share of pixels that moved by more
-            # than the tolerance. uint8-safe absolute difference.
+            # share of pixels that moved by more than the tolerance, over the
+            # part of the screen we are counting. uint8-safe absolute difference.
             diff = np.maximum(cur, prev) - np.minimum(cur, prev)
-            if np.count_nonzero(diff > tol) / cur.size > max_frac:
+            moved = diff > tol
+            if mask is not None:
+                moved &= mask
+            if np.count_nonzero(moved) / counted > max_frac:
                 last_change = t
         prev = cur
     return last_change, last_t
@@ -931,6 +1070,50 @@ def write_freeze_report(out_dir, plans):
     return out
 
 
+def end_strip(video, duration, batch, cfg, tmp_dir, ffmpeg):
+    """Snapshots for one 'batch' of the tail, newest batch first.
+
+    Batch 0 is the last `manual_span` seconds, batch 1 the span before that, and
+    so on. Returns [(absolute time, seconds from the end, png path)] in time
+    order, or [] once the batches run past the start of the clip.
+    """
+    span = max(1.0, float(cfg.get("manual_span", 10.0)))
+    shots = max(1, int(cfg.get("manual_shots", 4)))
+    width = max(80, int(cfg.get("manual_width", 190)))
+    end = duration - span * batch
+    start = max(0.0, end - span)
+    if end <= 0.01 or end - start < 1.0 / shots:
+        return []
+    frames = extract_frames(video, start, end - start, shots,
+                            f"scale={width}:-2", Path(tmp_dir) / f"b{batch}",
+                            ffmpeg, ext="png")
+    return [(t, duration - t, p) for t, p in frames if t <= duration + 0.01]
+
+
+def diagnose_map_region(video, cfg, ocr, tmp_dir, ffmpeg, ffprobe, samples=8):
+    """Sample a clip, OCR the chosen region, and report exactly what came back.
+
+    This is the tool for the case where auto-sorting finds nothing: it shows the
+    crop the app is actually reading and the text it actually got, so the region
+    can be corrected instead of guessed at.
+    """
+    dur = probe_duration(video, ffprobe)
+    if dur <= 0:
+        return []
+    vf = roi_filter(cfg["region"], custom=cfg.get("custom_rect"))
+    span = max(0.5, dur - 0.2)
+    fps = max(0.05, samples / span)
+    frames = extract_frames(video, 0.0, span, fps, vf, Path(tmp_dir) / "diag",
+                            ffmpeg, ext="png")
+    maps = cfg.get("map_list") or []
+    out = []
+    for t, png in frames[:samples]:
+        text = " ".join(ocr.recognize(png)) if ocr else ""
+        out.append({"time": t, "png": png, "text": text.strip(),
+                    "match": match_map(text, maps)})
+    return out
+
+
 # =========================================================================== #
 #                            MAP SORTER  engine
 # =========================================================================== #
@@ -953,14 +1136,26 @@ def _squash(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
 
 
-def match_map(text, maps):
-    """Which map name (if any) this scoreboard text is naming."""
+def match_map_strict(text, maps):
+    """Only an exact run of the map's letters counts. Noise practically never
+    produces one, so a single strict hit is worth trusting on its own."""
     n = _squash(text)
     if len(n) < 3:
         return None
-    for m in maps:                        # exact substring first (covers short names)
+    for m in maps:
         if _squash(m) and _squash(m) in n:
             return m
+    return None
+
+
+def match_map(text, maps):
+    """Which map name (if any) this scoreboard text is naming."""
+    exact = match_map_strict(text, maps)
+    if exact:
+        return exact
+    n = _squash(text)
+    if len(n) < 3:
+        return None
     for m in maps:                        # fuzzy only for names long enough to be safe
         mn = _squash(m)
         if len(mn) < 5:
@@ -971,8 +1166,28 @@ def match_map(text, maps):
     return None
 
 
-def roi_filter(region, out_w=1200):
-    x1, y1, x2, y2 = MAP_REGIONS.get(region, MAP_REGIONS[DEFAULT_MAP_REGION])
+def parse_custom_region(text):
+    """"6, 10, 45, 18" (percentages) -> (0.06, 0.10, 0.45, 0.18). None if unusable."""
+    try:
+        parts = [float(p) for p in re.split(r"[,\s]+", str(text).strip()) if p != ""]
+    except ValueError:
+        return None
+    if len(parts) != 4:
+        return None
+    x1, y1, x2, y2 = (max(0.0, min(100.0, v)) / 100.0 for v in parts)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def region_rect(region, custom=None):
+    if region == CUSTOM_REGION:
+        return custom or MAP_REGIONS[DEFAULT_MAP_REGION]
+    return MAP_REGIONS.get(region, MAP_REGIONS[DEFAULT_MAP_REGION])
+
+
+def roi_filter(region, out_w=1200, custom=None):
+    x1, y1, x2, y2 = region_rect(region, custom)
     w, h = max(0.01, x2 - x1), max(0.01, y2 - y1)
     if (x1, y1, x2, y2) == (0.0, 0.0, 1.0, 1.0):
         return f"scale={out_w}:-2"
@@ -1003,7 +1218,7 @@ def detect_map(video, duration, cfg, ocr, tmp_dir, cancel, ffmpeg, threads=1):
         return None
     interval = max(0.1, float(cfg["interval"]))
     min_hits = max(1, int(cfg["min_hits"]))
-    vf = roi_filter(cfg["region"])
+    vf = roi_filter(cfg["region"], custom=cfg.get("custom_rect"))
     tally = Counter()
     t = 0.0
     duration = max(0.0, duration)
@@ -1014,10 +1229,16 @@ def detect_map(video, duration, cfg, ocr, tmp_dir, cancel, ffmpeg, threads=1):
                                 1.0 / interval, vf, tmp_dir, ffmpeg)
         for text in read_texts(frames, ocr, threads, cancel):
             m = match_map(text, maps)
-            if m:
-                tally[m] += 1
-                if tally[m] >= min_hits:
-                    return m
+            if not m:
+                continue
+            if match_map_strict(text, maps) == m:
+                # the map's letters read exactly. A scoreboard that is only up
+                # for a moment may never land on a second sample, and demanding
+                # one is how a real hit gets thrown away.
+                return m
+            tally[m] += 1                 # a fuzzy read still needs confirming
+            if tally[m] >= min_hits:
+                return m
         t += WINDOW_S
     return None
 
@@ -1123,6 +1344,324 @@ def write_map_report(folder, rows):
 
 
 # =========================================================================== #
+#                   MAP RECOGNITION  (learning from what you sorted)
+# =========================================================================== #
+# The scoreboard only names the map when you happen to pull it up, which is a
+# minority of clips. So the map is also recognised by how it LOOKS, using the
+# clips you have already sorted by hand as the reference set.
+#
+# Frames are turned into vectors and compared. On a Mac that vector is Apple's
+# Vision "feature print" — a learned embedding meant for "are these pictures of
+# the same place", which survives a moving camera, changing light and clutter in
+# a way a colour histogram does not. Everywhere else there is a much weaker
+# colour-layout stand-in so the code path still runs.
+
+REF_FILE = "map_references.npz"
+
+
+class VisionEmbedder:
+    """Apple Vision image feature print. Runs on the Neural Engine."""
+    name = "Apple Vision feature print"
+
+    @staticmethod
+    def available():
+        if not IS_MAC:
+            return False
+        try:
+            import Vision
+            import Foundation      # noqa: F401
+            return hasattr(Vision, "VNGenerateImageFeaturePrintRequest")
+        except Exception:
+            return False
+
+    def __init__(self):
+        import Vision
+        import Foundation
+        self._V = Vision
+        self._NSURL = Foundation.NSURL
+
+    def embed(self, image_path):
+        np = _numpy()
+        if np is None:
+            return None
+        try:
+            url = self._NSURL.fileURLWithPath_(str(image_path))
+            handler = self._V.VNImageRequestHandler.alloc().initWithURL_options_(url, {})
+            req = self._V.VNGenerateImageFeaturePrintRequest.alloc().init()
+            ok, _err = handler.performRequests_error_([req], None)
+            if not ok:
+                return None
+            results = req.results() or []
+            if not results:
+                return None
+            obs = results[0]
+            raw = bytes(obs.data())
+            count = int(obs.elementCount())
+            if count <= 0 or not raw:
+                return None
+            itemsize = len(raw) // count
+            dtype = {2: np.float16, 4: np.float32, 8: np.float64}.get(itemsize)
+            if dtype is None:
+                return None
+            vec = np.frombuffer(raw, dtype=dtype, count=count).astype(np.float32)
+        except Exception:
+            return None
+        return unit(vec)
+
+
+class TileEmbedder:
+    """Fallback: a coarse colour-layout descriptor.
+
+    Far weaker than a learned embedding — it is here so the feature works
+    (and can be tested) without PyObjC, not because it is good.
+    """
+    name = "colour layout (fallback)"
+    GRID = (24, 14)
+
+    @staticmethod
+    def available():
+        return _numpy() is not None and find_exe("ffmpeg") is not None
+
+    def __init__(self):
+        self.ffmpeg = find_exe("ffmpeg")
+
+    def embed(self, image_path):
+        np = _numpy()
+        w, h = self.GRID
+        try:
+            out = subprocess.run(
+                [self.ffmpeg, "-hide_banner", "-v", "error", "-nostdin",
+                 "-i", str(image_path), "-vf", f"scale={w}:{h}:flags=area",
+                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                capture_output=True, check=True).stdout
+        except Exception:
+            return None
+        need = w * h * 3
+        if len(out) < need:
+            return None
+        vec = np.frombuffer(out[:need], dtype=np.uint8).astype(np.float32)
+        vec -= vec.mean()                      # take out overall brightness
+        return unit(vec)
+
+
+def unit(vec):
+    np = _numpy()
+    n = float(np.linalg.norm(vec))
+    return vec / n if n > 1e-9 else vec
+
+
+def pick_embedder(prefer_vision=True):
+    """(embedder, note). None when nothing usable is installed."""
+    if prefer_vision and VisionEmbedder.available():
+        return VisionEmbedder(), ""
+    if TileEmbedder.available():
+        note = ("Apple Vision image matching is unavailable, so a much weaker "
+                "colour-based match is being used. Expect poor accuracy.\n"
+                "For the real thing:  pip3 install pyobjc-framework-Vision") if IS_MAC else ""
+        return TileEmbedder(), note
+    return None, "Map recognition needs numpy and ffmpeg."
+
+
+def sample_frames(video, count, width, out_dir, ffmpeg, ffprobe, duration=None):
+    """`count` PNG frames spread across a clip, skipping the very start and end."""
+    dur = duration if duration is not None else probe_duration(video, ffprobe)
+    if dur <= 0:
+        return []
+    count = max(1, int(count))
+    start = dur * 0.05
+    span = max(0.2, dur * 0.9)
+    frames = extract_frames(video, start, span, count / span, f"scale={width}:-2",
+                            out_dir, ffmpeg, ext="png")
+    return [p for _t, p in frames][:count]
+
+
+def embed_clip(video, cfg, embedder, tmp_dir, ffmpeg, ffprobe, frames=None):
+    """Vectors for a handful of frames from one clip. Returns an (n, d) array."""
+    np = _numpy()
+    n = int(frames if frames is not None else cfg.get("query_frames", 12))
+    paths = sample_frames(video, n, int(cfg.get("ref_width", 320)), tmp_dir,
+                          ffmpeg, ffprobe)
+    vecs = [v for v in (embedder.embed(p) for p in paths) if v is not None]
+    if not vecs:
+        return np.zeros((0, 1), dtype=np.float32)
+    dim = min(len(v) for v in vecs)
+    return np.stack([v[:dim] for v in vecs]).astype(np.float32)
+
+
+def build_references(root, cfg, embedder, ffmpeg, ffprobe, progress=None, cancel=None):
+    """Learn from the map folders already sorted by hand.
+
+    Every subfolder of `root` is treated as a map name and its clips as examples.
+    Returns {"vectors", "labels", "clips", "meta"}.
+    """
+    np = _numpy()
+    root = Path(root)
+    per_clip = int(cfg.get("ref_frames", 4))
+    cap = int(cfg.get("ref_max_clips", 80))
+    folders = sorted(d for d in root.iterdir()
+                     if d.is_dir() and not d.name.startswith((".", "_")))
+    jobs = []
+    for d in folders:
+        clips = list_videos(d)[:cap]
+        if clips:
+            jobs.append((d.name, clips))
+    total = sum(len(c) for _n, c in jobs)
+    if not total:
+        return {"vectors": np.zeros((0, 1), np.float32), "labels": [], "clips": [],
+                "meta": {"maps": 0, "clips": 0, "frames": 0}}
+
+    vectors, labels, clips_out = [], [], []
+    done = 0
+    tmp = Path(tempfile.mkdtemp(prefix="fcstudio_refs_"))
+    try:
+        for name, clips in jobs:
+            for clip in clips:
+                if cancel is not None and cancel.is_set():
+                    break
+                vecs = embed_clip(clip, cfg, embedder, tmp / "f", ffmpeg, ffprobe,
+                                  frames=per_clip)
+                for v in vecs:
+                    vectors.append(v)
+                    labels.append(name)
+                    clips_out.append(f"{name}/{clip.name}")
+                done += 1
+                if progress:
+                    progress(done, total, name)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if not vectors:
+        return {"vectors": np.zeros((0, 1), np.float32), "labels": [], "clips": [],
+                "meta": {"maps": 0, "clips": 0, "frames": 0}}
+    dim = min(len(v) for v in vectors)
+    mat = np.stack([v[:dim] for v in vectors]).astype(np.float32)
+    meta = {"maps": len(set(labels)), "clips": len(set(clips_out)),
+            "frames": len(labels), "dim": int(dim), "embedder": embedder.name,
+            "root": str(root), "built": time.strftime("%Y-%m-%d %H:%M")}
+    return {"vectors": mat, "labels": labels, "clips": clips_out, "meta": meta}
+
+
+def save_references(store, path):
+    np = _numpy()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, vectors=store["vectors"],
+                        labels=np.array(store["labels"], dtype=object),
+                        clips=np.array(store["clips"], dtype=object),
+                        meta=json.dumps(store["meta"]))
+    return path
+
+
+def load_references(path):
+    np = _numpy()
+    try:
+        with np.load(Path(path), allow_pickle=True) as z:
+            return {"vectors": z["vectors"],
+                    "labels": [str(x) for x in z["labels"]],
+                    "clips": [str(x) for x in z["clips"]],
+                    "meta": json.loads(str(z["meta"]))}
+    except Exception:
+        return None
+
+
+def classify_vectors(store, queries, k=7, exclude_clip=None):
+    """Vote the query frames against the reference set.
+
+    Returns (best map, confidence 0-1, runner-up, {map: share}). Confidence is
+    the winner's share of the vote, so 1.0 means every frame agreed.
+    """
+    np = _numpy()
+    refs, labels = store["vectors"], store["labels"]
+    if refs.size == 0 or queries is None or len(queries) == 0:
+        return (None, 0.0, None, {})
+    dim = min(refs.shape[1], queries.shape[1])
+    sims = queries[:, :dim] @ refs[:, :dim].T          # both are unit vectors
+    if exclude_clip is not None:
+        mask = np.array([c == exclude_clip for c in store["clips"]])
+        if mask.any():
+            sims[:, mask] = -2.0
+    k = max(1, min(int(k), sims.shape[1]))
+    votes = {}
+    for row in sims:
+        idx = np.argpartition(-row, k - 1)[:k]
+        for j in idx:
+            s = float(row[j])
+            if s <= -1.5:
+                continue
+            votes[labels[j]] = votes.get(labels[j], 0.0) + max(0.0, s)
+    if not votes:
+        return (None, 0.0, None, {})
+    total = sum(votes.values()) or 1.0
+    shares = {m: v / total for m, v in votes.items()}
+    order = sorted(shares.items(), key=lambda kv: -kv[1])
+    best, conf = order[0]
+    runner = order[1][0] if len(order) > 1 else None
+    return (best, conf, runner, shares)
+
+
+def identify_clip(video, store, cfg, embedder, tmp_dir, ffmpeg, ffprobe):
+    """Best guess at the map for one clip."""
+    vecs = embed_clip(video, cfg, embedder, tmp_dir, ffmpeg, ffprobe)
+    return classify_vectors(store, vecs, k=int(cfg.get("knn", 7)))
+
+
+def reference_accuracy(store, cfg, holdout=0.3, seed=7):
+    """How often the guess is right, measured honestly.
+
+    Clips are held out WHOLE — never individual frames. Frames from one clip look
+    almost identical to each other, so splitting by frame would leave a near-copy
+    of every test frame in the reference set and report an accuracy that has
+    nothing to do with sorting a new clip.
+    """
+    np = _numpy()
+    labels, clips = store["labels"], store["clips"]
+    if store["vectors"].size == 0:
+        return {"tested": 0, "correct": 0, "accuracy": 0.0, "per_map": {},
+                "confusion": {}, "note": "no references"}
+    by_clip = {}
+    for i, c in enumerate(clips):
+        by_clip.setdefault(c, {"label": labels[i], "rows": []})["rows"].append(i)
+
+    rng = random.Random(seed)
+    per_label = {}
+    for c, info in by_clip.items():
+        per_label.setdefault(info["label"], []).append(c)
+    test = []
+    for label, cs in per_label.items():
+        if len(cs) < 2:
+            continue                       # nothing to hold out from
+        cs = sorted(cs)
+        rng.shuffle(cs)
+        n = max(1, int(round(len(cs) * holdout)))
+        test.extend(cs[:n])
+    if not test:
+        return {"tested": 0, "correct": 0, "accuracy": 0.0, "per_map": {},
+                "confusion": {}, "note": "not enough clips per map to hold any out"}
+
+    k = int(cfg.get("knn", 7))
+    correct = 0
+    per_map = {}
+    confusion = {}
+    for c in test:
+        info = by_clip[c]
+        q = store["vectors"][info["rows"]]
+        guess, _conf, _run, _shares = classify_vectors(store, q, k=k, exclude_clip=c)
+        truth = info["label"]
+        hit = (guess == truth)
+        correct += hit
+        d = per_map.setdefault(truth, {"tested": 0, "correct": 0})
+        d["tested"] += 1
+        d["correct"] += hit
+        if not hit:
+            confusion.setdefault(truth, {})
+            confusion[truth][guess or "no guess"] = \
+                confusion[truth].get(guess or "no guess", 0) + 1
+    return {"tested": len(test), "correct": correct,
+            "accuracy": correct / len(test) if test else 0.0,
+            "per_map": per_map, "confusion": confusion, "note": ""}
+
+
+# =========================================================================== #
 #                                   GUI
 # =========================================================================== #
 def run_gui(preset_folder=None):
@@ -1144,6 +1683,16 @@ def run_gui(preset_folder=None):
 
     def post(kind, payload):
         msg_q.put((kind, payload))
+
+    def theme_bg():
+        """The background the ttk theme paints frames with, so cells look flat."""
+        try:
+            c = ttk.Style().lookup("TFrame", "background")
+            if c:
+                return c
+        except Exception:
+            pass
+        return root.cget("bg")
 
     book = ttk.Notebook(root)
     book.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1289,6 +1838,31 @@ def run_gui(preset_folder=None):
     ttk.Checkbutton(fz_boxes, text="Exact cut (re-encode). Off = instant stream copy",
                     variable=fz_exact).grid(row=1, column=1, sticky="w", padx=20)
 
+    ttk.Separator(det, orient="horizontal").pack(fill="x", padx=10, pady=(2, 0))
+    adv = ttk.Frame(det); adv.pack(fill="x", padx=10, pady=(6, 8))
+    ttk.Label(adv, text="Ignore this part of the screen:").grid(row=0, column=0, sticky="w")
+    fz_ignore = tk.StringVar(value=fz_cfg["ignore_region"] if fz_cfg["ignore_region"]
+                             in IGNORE_REGIONS else "None")
+    ttk.Combobox(adv, textvariable=fz_ignore, values=list(IGNORE_REGIONS), width=20,
+                 state="readonly").grid(row=0, column=1, sticky="w", padx=(6, 14))
+    ttk.Label(adv, foreground="#888",
+              text="a gamertag or killfeed that never stops moving would otherwise "
+                   "hide the freeze").grid(row=0, column=2, sticky="w")
+
+    fz_manual = tk.BooleanVar(value=bool(fz_cfg["manual_end"]))
+    ttk.Checkbutton(adv, text="Advanced: hand-pick the end of clips where no freeze "
+                              "was found", variable=fz_manual).grid(
+        row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    mrow = ttk.Frame(adv); mrow.grid(row=2, column=0, columnspan=3, sticky="w", padx=(22, 0))
+    ttk.Label(mrow, text="Show").pack(side="left")
+    fz_shots = tk.IntVar(value=int(fz_cfg["manual_shots"]))
+    ttk.Spinbox(mrow, from_=1, to=10, width=4, textvariable=fz_shots).pack(side="left", padx=4)
+    ttk.Label(mrow, text="snapshots per second, going back").pack(side="left")
+    fz_span = tk.DoubleVar(value=float(fz_cfg["manual_span"]))
+    ttk.Spinbox(mrow, from_=2.0, to=60.0, increment=1.0, width=5, format="%.0f",
+                textvariable=fz_span).pack(side="left", padx=4)
+    ttk.Label(mrow, text="seconds from the end at a time.").pack(side="left")
+
     fz_act = ttk.Frame(fz_tab); fz_act.pack(fill="x", padx=10)
     fz_start = ttk.Button(fz_act, text="Start Freeze Tail scan", command=lambda: fz_go())
     fz_start.pack(side="left")
@@ -1327,7 +1901,8 @@ def run_gui(preset_folder=None):
     # ===================================================================== #
     mp = {"cancel": threading.Event(), "running": False, "folder": None,
           "snap_dir": None, "queue": [], "idx": 0, "undo": [], "rows": [],
-          "photos": [], "maps": parse_map_list(mp_cfg["maps"]), "reviewing": False}
+          "photos": [], "maps": parse_map_list(mp_cfg["maps"]), "reviewing": False,
+          "refs": None}
 
     mp_top = ttk.Frame(mp_tab); mp_top.pack(fill="x", padx=10, pady=(10, 4))
     ttk.Label(mp_top, text="Clips folder:").pack(side="left")
@@ -1352,9 +1927,10 @@ def run_gui(preset_folder=None):
     ttk.Checkbutton(mrow2, text="Stage 1: read the scoreboard and file those clips "
                                 "automatically", variable=mp_auto).pack(side="left")
     ttk.Label(mrow2, text="   Read").pack(side="left")
-    mp_region = tk.StringVar(value=mp_cfg["region"] if mp_cfg["region"] in MAP_REGIONS
+    _regions = list(MAP_REGIONS) + [CUSTOM_REGION]
+    mp_region = tk.StringVar(value=mp_cfg["region"] if mp_cfg["region"] in _regions
                              else DEFAULT_MAP_REGION)
-    ttk.Combobox(mrow2, textvariable=mp_region, values=list(MAP_REGIONS), width=20,
+    ttk.Combobox(mrow2, textvariable=mp_region, values=_regions, width=22,
                  state="readonly").pack(side="left", padx=6)
     ttk.Label(mrow2, text="   Snapshots").pack(side="left")
     mp_snaps = tk.IntVar(value=int(mp_cfg["snaps"]))
@@ -1365,6 +1941,37 @@ def run_gui(preset_folder=None):
                  state="readonly").pack(side="left", padx=6)
     mp_engine = tk.StringVar(value="")
     ttk.Label(mrow2, textvariable=mp_engine, foreground="#888").pack(side="left", padx=10)
+
+    mrow3 = ttk.Frame(mp_set); mrow3.pack(fill="x", padx=10, pady=(0, 8))
+    ttk.Label(mrow3, text="Custom region (x1, y1, x2, y2 as % of the frame):").pack(side="left")
+    mp_custom = tk.StringVar(value=mp_cfg["custom_region"])
+    ttk.Entry(mrow3, textvariable=mp_custom, width=18).pack(side="left", padx=6)
+    ttk.Button(mrow3, text="Test region on one clip…",
+               command=lambda: mp_diagnose()).pack(side="left", padx=6)
+    ttk.Label(mrow3, foreground="#888",
+              text="run this if nothing is being auto-sorted — it shows what the "
+                   "reader actually sees").pack(side="left")
+
+    rec = ttk.LabelFrame(mp_tab, text="Recognise the map by how it looks (beta)")
+    rec.pack(fill="x", padx=10, pady=(0, 6))
+    rrow1 = ttk.Frame(rec); rrow1.pack(fill="x", padx=10, pady=(8, 2))
+    ttk.Label(rrow1, text="Learn from already-sorted folders in:").pack(side="left")
+    mp_ref_root = tk.StringVar(value=mp_cfg["ref_root"])
+    ttk.Entry(rrow1, textvariable=mp_ref_root).pack(side="left", fill="x", expand=True, padx=6)
+    ttk.Button(rrow1, text="Choose…",
+               command=lambda: pick_dir(mp_ref_root, "Folder holding your map subfolders")
+               ).pack(side="left")
+
+    rrow2 = ttk.Frame(rec); rrow2.pack(fill="x", padx=10, pady=(2, 8))
+    mp_recognize = tk.BooleanVar(value=bool(mp_cfg["recognize"]))
+    ttk.Checkbutton(rrow2, text="Suggest a map during review — press Space to accept",
+                    variable=mp_recognize).pack(side="left")
+    ttk.Button(rrow2, text="Build references…",
+               command=lambda: mp_build_refs()).pack(side="left", padx=(14, 6))
+    ttk.Button(rrow2, text="Test accuracy…",
+               command=lambda: mp_test_accuracy()).pack(side="left")
+    mp_refs_note = tk.StringVar(value="No references yet.")
+    ttk.Label(rrow2, textvariable=mp_refs_note, foreground="#888").pack(side="left", padx=12)
 
     mp_act = ttk.Frame(mp_tab); mp_act.pack(fill="x", padx=10)
     mp_start = ttk.Button(mp_act, text="Start Map Sorter", command=lambda: mp_go())
@@ -1379,6 +1986,9 @@ def run_gui(preset_folder=None):
     mp_status = tk.StringVar(value="Choose the folder of clips, then press Start.")
     ttk.Label(mp_tab, textvariable=mp_status, font=("", 12, "bold")).pack(
         anchor="w", padx=10, pady=(8, 2))
+    mp_guess = tk.StringVar(value="")
+    ttk.Label(mp_tab, textvariable=mp_guess, font=("", 13, "bold"),
+              foreground="#1a7f37").pack(anchor="w", padx=10)
     mp_bar = ttk.Progressbar(mp_tab, mode="determinate", maximum=1000)
     mp_bar.pack(fill="x", padx=10, pady=(0, 4))
 
@@ -1459,9 +2069,229 @@ def run_gui(preset_folder=None):
             "spread": mp_spread.get(),
             "snap_width": int(mp_cfg["snap_width"]),
             "threads": max(1, int(mp_cfg["threads"]) or auto_threads()),
+            "custom_region": mp_custom.get(),
+            "recognize": bool(mp_recognize.get()),
+            "ref_root": mp_ref_root.get().strip(),
         })
         c["map_list"] = mp["maps"]
+        c["custom_rect"] = parse_custom_region(mp_custom.get())
         return c
+
+    # ---------------- recognising the map by how it looks ----------------
+    def mp_refs_path():
+        return settings_path().parent / REF_FILE
+
+    def mp_refs_label():
+        store = mp.get("refs")
+        if not store or not store["labels"]:
+            mp_refs_note.set("No references yet — press “Build references…”.")
+            return
+        m = store["meta"]
+        mp_refs_note.set(f"{m.get('maps', 0)} maps · {m.get('clips', 0)} clips · "
+                         f"{m.get('frames', 0)} frames · built {m.get('built', '?')}")
+
+    def mp_load_refs():
+        store = load_references(mp_refs_path())
+        if store and store["labels"]:
+            mp["refs"] = store
+        mp_refs_label()
+
+    def mp_build_refs():
+        root = mp_ref_root.get().strip() or mp_folder.get().strip()
+        if not root or not Path(root).is_dir():
+            messagebox.showwarning(APP_NAME, "Choose the folder that holds your "
+                                             "already-sorted map subfolders.")
+            return
+        if not preflight():
+            return
+        emb, note = pick_embedder()
+        if emb is None:
+            messagebox.showerror(APP_NAME, note); return
+        if note:
+            messagebox.showwarning(APP_NAME, note)
+        subs = [d for d in Path(root).iterdir()
+                if d.is_dir() and not d.name.startswith((".", "_")) and list_videos(d)]
+        if len(subs) < 2:
+            messagebox.showwarning(
+                APP_NAME,
+                f"Found {len(subs)} map folder(s) with clips in them.\n\n"
+                "Recognition learns by comparing maps against each other, so it needs "
+                "at least two folders — ideally a dozen or more clips in each.")
+            return
+        counts = ", ".join(f"{d.name}: {len(list_videos(d))}" for d in subs[:10])
+        if not messagebox.askyesno(
+                APP_NAME,
+                f"Learn from {len(subs)} map folder(s)?\n\n{counts}\n\n"
+                f"Up to {mp_current_cfg()['ref_max_clips']} clips per map, "
+                f"{mp_current_cfg()['ref_frames']} frames each. Nothing is moved or "
+                f"changed — the clips are only looked at."):
+            return
+        mp["cancel"] = threading.Event()
+        mp_start.configure(state="disabled")
+        mp_cancel_btn.configure(state="normal")
+        mp["running"] = True
+        save_settings(current_settings())
+        threading.Thread(target=mp_build_worker,
+                         args=(Path(root), mp_current_cfg(), emb), daemon=True).start()
+
+    def mp_build_worker(root, conf, emb):
+        try:
+            def progress(done, total, name):
+                post("mp_bar", done / max(1, total))
+                post("mp_status", f"Learning {name} — {done}/{total} clip(s)…")
+
+            store = build_references(root, conf, emb, ffmpeg, ffprobe,
+                                     progress, mp["cancel"])
+            if mp["cancel"].is_set():
+                post("mp_status", "Reference building stopped.")
+                post("mp_refs_built", None)
+                return
+            if not store["labels"]:
+                post("mp_status", "No usable frames were found in those folders.")
+                post("mp_refs_built", None)
+                return
+            save_references(store, mp_refs_path())
+            post("mp_refs_built", store)
+        except Exception as ex:
+            post("fail", str(ex))
+            post("mp_refs_built", None)
+
+    def mp_test_accuracy():
+        store = mp.get("refs")
+        if not store or not store["labels"]:
+            messagebox.showinfo(APP_NAME, "Build references first."); return
+        rep = reference_accuracy(store, mp_current_cfg())
+        if not rep["tested"]:
+            messagebox.showwarning(APP_NAME, f"Could not test: {rep['note']}.\n\n"
+                                             "Sort a few more clips per map and rebuild.")
+            return
+        win = tk.Toplevel(root)
+        win.title("How often is the guess right?")
+        win.transient(root)
+        win.geometry("640x560")
+        pad = ttk.Frame(win, padding=16); pad.pack(fill="both", expand=True)
+        pct = rep["accuracy"] * 100
+        ttk.Label(pad, text=f"{pct:.0f}% correct", font=("", 22, "bold"),
+                  foreground=("#1a7f37" if pct >= 70 else
+                              "#8a6d00" if pct >= 45 else "#b3261e")).pack(anchor="w")
+        ttk.Label(pad, text=f"{rep['correct']} of {rep['tested']} held-out clips, "
+                            f"{store['meta'].get('embedder', '?')}").pack(anchor="w")
+        ttk.Label(pad, foreground="#666", wraplength=580, justify="left",
+                  text="Whole clips were held out of the reference set and then "
+                       "identified, so this is what to expect on a clip the app has "
+                       "never seen — not a score it can flatter itself with."
+                  ).pack(anchor="w", pady=(6, 14))
+        ttk.Label(pad, text="Per map", font=("", 12, "bold")).pack(anchor="w")
+        tv = ttk.Treeview(pad, columns=("map", "score", "rate"), show="headings", height=9)
+        for c, w, t in (("map", 220, "Map"), ("score", 110, "Correct"),
+                        ("rate", 90, "Rate")):
+            tv.heading(c, text=t); tv.column(c, width=w, anchor="w")
+        tv.pack(fill="x", pady=(4, 12))
+        for m, d in sorted(rep["per_map"].items(),
+                           key=lambda kv: kv[1]["correct"] / max(1, kv[1]["tested"])):
+            r = d["correct"] / max(1, d["tested"])
+            tv.insert("", "end", values=(m, f"{d['correct']} / {d['tested']}",
+                                         f"{r * 100:.0f}%"))
+        if rep["confusion"]:
+            ttk.Label(pad, text="Most common mix-ups", font=("", 12, "bold")).pack(anchor="w")
+            lines = []
+            for truth, got in sorted(rep["confusion"].items()):
+                for guess, n in sorted(got.items(), key=lambda kv: -kv[1])[:2]:
+                    lines.append(f"   {truth}  read as  {guess}   ({n}×)")
+            ttk.Label(pad, text="\n".join(lines[:8]), justify="left",
+                      foreground="#b3261e").pack(anchor="w", pady=(4, 0))
+        ttk.Label(pad, foreground="#666", wraplength=580, justify="left",
+                  text="Low overall? Sort more clips per map and rebuild — the reference "
+                       "set is the whole model. Maps that get mixed up with each other "
+                       "are usually the ones that genuinely look alike; leave those to "
+                       "the number keys."
+                  ).pack(anchor="w", pady=(12, 0))
+        ttk.Button(pad, text="Close", command=win.destroy).pack(anchor="e", pady=(12, 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def mp_diagnose():
+        """Show what the reader actually sees in the chosen region, on one clip."""
+        folder = mp_folder.get().strip()
+        start_dir = folder if folder and Path(folder).is_dir() else str(Path.home())
+        path = filedialog.askopenfilename(
+            title="Pick one clip where the scoreboard is visible", initialdir=start_dir,
+            filetypes=[("Video", " ".join("*" + e for e in sorted(VIDEO_EXTS))),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        if not preflight():
+            return
+        ocr, note = pick_ocr()
+        if ocr is None:
+            messagebox.showerror(APP_NAME, note); return
+        conf = mp_current_cfg()
+        if conf["region"] == CUSTOM_REGION and conf["custom_rect"] is None:
+            messagebox.showwarning(
+                APP_NAME, "The custom region needs four numbers: x1, y1, x2, y2 as "
+                          "percentages of the frame, e.g.  6, 10, 45, 18")
+            return
+        mp_status.set("Reading the region on that clip…")
+        root.update_idletasks()
+        tmp = Path(tempfile.mkdtemp(prefix="fcstudio_diag_"))
+        try:
+            rows = diagnose_map_region(Path(path), conf, ocr, tmp, ffmpeg, ffprobe)
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, f"Could not read that clip:\n{ex}")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        if not rows:
+            messagebox.showwarning(APP_NAME, "No frames could be read from that clip.")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+
+        x1, y1, x2, y2 = region_rect(conf["region"], conf["custom_rect"])
+        win = tk.Toplevel(root)
+        win.title(f"What the reader sees — {Path(path).name}")
+        win.transient(root)
+        win.geometry("1020x640")
+        hits = [r for r in rows if r["match"]]
+        head = (f"Region “{conf['region']}” = x {x1 * 100:.0f}–{x2 * 100:.0f}%, "
+                f"y {y1 * 100:.0f}–{y2 * 100:.0f}% of the frame.   "
+                f"{len(hits)} of {len(rows)} sampled frames matched a map.")
+        ttk.Label(win, text=head, font=("", 12, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        ttk.Label(win, foreground="#666", wraplength=980, justify="left",
+                  text="Each row is the exact crop the reader was given and the exact text "
+                       "it returned. If the map name is not inside these crops, widen the "
+                       "region or set a custom one. If the name is visible but the text is "
+                       "wrong, the crop is too small or too low-contrast."
+                  ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        body = ttk.Frame(win); body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        cv = tk.Canvas(body, highlightthickness=0)
+        sb = ttk.Scrollbar(body, orient="vertical", command=cv.yview)
+        inner = ttk.Frame(cv)
+        cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.configure(yscrollcommand=sb.set)
+        cv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        keep = []
+        for i, r in enumerate(rows):
+            row = ttk.Frame(inner); row.grid(row=i, column=0, sticky="w", pady=6)
+            try:
+                ph = tk.PhotoImage(file=str(r["png"]))
+                while ph.width() > 620:
+                    ph = ph.subsample(2, 2)
+                keep.append(ph)
+                ttk.Label(row, image=ph).grid(row=0, column=0, rowspan=2, padx=(0, 10))
+            except Exception:
+                ttk.Label(row, text="(crop unreadable)").grid(row=0, column=0, padx=(0, 10))
+            ttk.Label(row, text=f"{hhmmss(r['time'])}", font=("", 10, "bold")).grid(
+                row=0, column=1, sticky="w")
+            verdict = f"matched {r['match']}" if r["match"] else "no map matched"
+            ttk.Label(row, text=f"read: {r['text'] or '(nothing)'}\n{verdict}",
+                      wraplength=320, justify="left",
+                      foreground=("#1a7f37" if r["match"] else "#b3261e")).grid(
+                row=1, column=1, sticky="w")
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda: (shutil.rmtree(tmp, ignore_errors=True), win.destroy()))
+        mp_status.set(f"Region test: {len(hits)} of {len(rows)} frames matched a map.")
 
     def mp_purge():
         folder = mp_folder.get().strip()
@@ -1558,13 +2388,31 @@ def run_gui(preset_folder=None):
             post("mp_status", f"Stage 2 — making snapshots for {len(remaining)} clip(s)…")
             snap_dir = find_or_make_snap_dir(folder)
             mp["snap_dir"] = snap_dir
+            store = mp.get("refs") if conf.get("recognize") else None
+            emb = None
+            if store and store["labels"]:
+                emb, _note = pick_embedder()
+            qtmp = Path(tempfile.mkdtemp(prefix="fcstudio_ident_"))
             review = []
-            for i, v in enumerate(remaining, 1):
-                if mp["cancel"].is_set():
-                    break
-                snaps = extract_snapshots(v, snap_dir, conf, ffmpeg, ffprobe)
-                review.append((v, snaps))
-                post("mp_bar", 0.6 + 0.4 * i / len(remaining))
+            try:
+                for i, v in enumerate(remaining, 1):
+                    if mp["cancel"].is_set():
+                        break
+                    snaps = extract_snapshots(v, snap_dir, conf, ffmpeg, ffprobe)
+                    guess = None
+                    if emb is not None:
+                        try:
+                            name, conf_score, runner, _shares = identify_clip(
+                                v, store, conf, emb, qtmp / "q", ffmpeg, ffprobe)
+                            if name:
+                                guess = (name, conf_score, runner)
+                        except Exception:
+                            guess = None
+                    review.append({"video": v, "snaps": snaps, "guess": guess})
+                    post("mp_bar", 0.6 + 0.4 * i / len(remaining))
+                    post("mp_status", f"Stage 2 — prepared {i}/{len(remaining)}…")
+            finally:
+                shutil.rmtree(qtmp, ignore_errors=True)
             post("mp_review", review)
         except Exception as ex:
             post("fail", str(ex))
@@ -1580,8 +2428,16 @@ def run_gui(preset_folder=None):
         idx, q = mp["idx"], mp["queue"]
         if idx >= len(q):
             mp_finish_review(); return
-        video, snaps = q[idx]
+        item = q[idx]
+        video, snaps, guess = item["video"], item["snaps"], item.get("guess")
         mp_status.set(f"Manual review — clip {idx + 1} of {len(q)}:  {video.name}")
+        if guess:
+            name, conf_score, runner = guess
+            extra = f"   (next best: {runner})" if runner else ""
+            mp_guess.set(f"Best guess: {name} — {conf_score * 100:.0f}% confident."
+                         f"   Press Space to accept.{extra}")
+        else:
+            mp_guess.set("")
         mp_clear_strip()
         for i, png in enumerate(snaps):
             try:
@@ -1613,7 +2469,7 @@ def run_gui(preset_folder=None):
         idx, q = mp["idx"], mp["queue"]
         if idx >= len(q):
             return
-        video, _snaps = q[idx]
+        video = q[idx]["video"]
         try:
             dest = move_to_map(video, mp["folder"], name)
         except Exception as ex:
@@ -1627,10 +2483,19 @@ def run_gui(preset_folder=None):
     def mp_skip(self=None):
         if not mp["reviewing"] or mp["idx"] >= len(mp["queue"]):
             return
-        video, _ = mp["queue"][mp["idx"]]
+        video = mp["queue"][mp["idx"]]["video"]
         mp_record(video, "—", "skipped", "")
         mp["idx"] += 1
         mp_show_current()
+
+    def mp_accept_guess():
+        if not mp["reviewing"] or mp["idx"] >= len(mp["queue"]):
+            return
+        guess = mp["queue"][mp["idx"]].get("guess")
+        if not guess:
+            mp_status.set("No guess for this clip — pick a map with the number keys.")
+            return
+        mp_choose(guess[0])
 
     def mp_undo():
         if not mp["reviewing"]:
@@ -1655,6 +2520,7 @@ def run_gui(preset_folder=None):
 
     def mp_finish_review():
         mp["reviewing"] = False
+        mp_guess.set("")
         mp_clear_strip()
         tally = Counter(r["map"] for r in mp["rows"] if r["map"] != "—")
         skipped = sum(1 for r in mp["rows"] if r["how"] == "skipped")
@@ -1679,6 +2545,7 @@ def run_gui(preset_folder=None):
         mp["reviewing"] = False
         mp_start.configure(state="normal")
         mp_cancel_btn.configure(state="disabled")
+        auto_tidy()
 
     def mp_key(action):
         """Number/letter shortcuts, but only on this tab and not while typing."""
@@ -1699,6 +2566,7 @@ def run_gui(preset_folder=None):
         root.bind(str(_i + 1), mp_key(lambda i=_i: (
             mp_choose(mp["maps"][i]) if i < len(mp["maps"]) else None)))
     root.bind("0", mp_key(lambda: mp_choose(OTHER_MAP)))
+    root.bind("<space>", mp_key(mp_accept_guess))
     for _k in ("s", "S"):
         root.bind(_k, mp_key(mp_skip))
     for _k in ("z", "Z"):
@@ -1760,6 +2628,13 @@ def run_gui(preset_folder=None):
                 "exact_cut": bool(fz_exact.get()),
                 "in_folder": fz_in.get().strip(),
                 "out_folder": fz_out.get().strip(),
+                "ignore_region": fz_ignore.get(),
+                "manual_end": bool(fz_manual.get()),
+                "manual_shots": max(1, int(safe_float(fz_shots.get(),
+                                                      FZ_DEFAULTS["manual_shots"]))),
+                "manual_span": max(2.0, safe_float(fz_span.get(),
+                                                   FZ_DEFAULTS["manual_span"])),
+                "manual_width": int(fz_cfg["manual_width"]),
             },
             "maps": {
                 **MAP_DEFAULTS,
@@ -1774,6 +2649,9 @@ def run_gui(preset_folder=None):
                 "interval": float(mp_cfg["interval"]),
                 "min_hits": int(mp_cfg["min_hits"]),
                 "snap_interval": float(mp_cfg["snap_interval"]),
+                "custom_region": mp_custom.get(),
+                "recognize": bool(mp_recognize.get()),
+                "ref_root": mp_ref_root.get().strip(),
             },
         }
 
@@ -1858,6 +2736,7 @@ def run_gui(preset_folder=None):
                       f"{OUT_MISSES}/, {errs} error(s).")
         if not stopped:
             bp_bar["value"] = 1000
+        auto_tidy()
 
     # --------------------------- Freeze Tail run --------------------------
     def fz_stop():
@@ -1935,6 +2814,158 @@ def run_gui(preset_folder=None):
         box["event"].wait()
         return bool(box["answer"])
 
+    def fz_end_review(plan, conf, tmp_dir):
+        """Hand-pick where a clip should end. Returns ('trim', t) / ('skip',) / ('cancel',)."""
+        video, duration = plan["video"], plan["total"]
+        win = tk.Toplevel(root)
+        win.title(f"Where should this clip end?  —  {video.name}")
+        win.transient(root)
+        win.geometry("1180x420")
+        res = {"action": "skip", "time": None}
+        loaded = []                       # [(abs time, seconds from end, png)]
+        photos = []
+        cells = {}
+        state = {"sel": None, "batch": 0}
+
+        ttk.Label(win, text=video.name, font=("", 13, "bold")).pack(anchor="w", padx=12,
+                                                                    pady=(10, 0))
+        info = tk.StringVar(value="")
+        ttk.Label(win, textvariable=info, foreground="#666").pack(anchor="w", padx=12)
+
+        wrap = ttk.Frame(win); wrap.pack(fill="both", expand=True, padx=12, pady=8)
+        canvas = tk.Canvas(wrap, highlightthickness=0)
+        xbar = ttk.Scrollbar(wrap, orient="horizontal", command=canvas.xview)
+        strip = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=strip, anchor="nw")
+        strip.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.configure(xscrollcommand=xbar.set)
+        canvas.pack(fill="both", expand=True)
+        xbar.pack(fill="x")
+
+        chosen = tk.StringVar(value="Nothing picked yet — click a frame.")
+        ttk.Label(win, textvariable=chosen, font=("", 12, "bold")).pack(anchor="w", padx=12)
+
+        bar = ttk.Frame(win); bar.pack(fill="x", padx=12, pady=(4, 12))
+        use_btn = ttk.Button(bar, text="Use this frame as the end",
+                             state="disabled", command=lambda: finish("trim"))
+        back_btn = ttk.Button(bar, text="◀ Go further back",
+                              command=lambda: load_batch(state["batch"] + 1))
+
+        def scroll(units):
+            canvas.xview_scroll(units, "units")
+
+        ttk.Button(bar, text="◀", width=3, command=lambda: scroll(-6)).pack(side="left")
+        ttk.Button(bar, text="▶", width=3, command=lambda: scroll(6)).pack(side="left", padx=(4, 14))
+        back_btn.pack(side="left")
+        use_btn.pack(side="left", padx=14)
+        ttk.Button(bar, text="Skip — keep this clip whole",
+                   command=lambda: finish("skip")).pack(side="left")
+        ttk.Button(bar, text="Stop reviewing",
+                   command=lambda: finish("cancel")).pack(side="right")
+
+        def select(idx):
+            state["sel"] = idx
+            for i, cell in cells.items():
+                cell.configure(highlightbackground=("#2ecc71" if i == idx else theme_bg()),
+                               highlightthickness=3)
+            t, back, _p = loaded[idx]
+            chosen.set(f"Cut at {hhmmss(t)}  —  {back:.2f}s before the current end, "
+                       f"removing {back:.2f}s")
+            use_btn.configure(state="normal")
+
+        def render():
+            for w in strip.winfo_children():
+                w.destroy()
+            cells.clear()
+            photos.clear()
+            bg = theme_bg()
+            for i, (t, back, png) in enumerate(loaded):
+                cell = tk.Frame(strip, bg=bg, highlightthickness=3, highlightbackground=bg)
+                try:
+                    ph = tk.PhotoImage(file=str(png))
+                    photos.append(ph)
+                    btn = tk.Button(cell, image=ph, bd=0,
+                                    command=lambda i=i: select(i))
+                    btn.pack()
+                    btn.bind("<Double-Button-1>",
+                             lambda e, i=i: (select(i), finish("trim")))
+                except Exception:
+                    tk.Button(cell, text=f"−{back:.2f}s", width=12,
+                              command=lambda i=i: select(i)).pack()
+                tk.Label(cell, text=f"−{back:.2f}s", font=("", 9), bg=bg).pack()
+                cell.grid(row=0, column=i, padx=3)
+                cells[i] = cell
+            strip.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.xview_moveto(1.0)          # newest frames first
+            state["sel"] = None
+            use_btn.configure(state="disabled")
+            chosen.set("Nothing picked yet — click the frame closest to where the "
+                       "action really ends.")
+
+        def load_batch(n):
+            info.set(f"Loading snapshots {n * conf['manual_span']:.0f}–"
+                     f"{(n + 1) * conf['manual_span']:.0f}s from the end…")
+            win.update_idletasks()
+            got = end_strip(video, duration, n, conf, tmp_dir, ffmpeg)
+            if not got:
+                info.set(f"That is as far back as this clip goes "
+                         f"({hhmmss(duration)} long).")
+                back_btn.configure(state="disabled")
+                return
+            state["batch"] = n
+            loaded[:0] = got                  # earlier frames go on the left
+            render()
+            span = conf["manual_span"]
+            info.set(f"{len(loaded)} snapshots, {conf['manual_shots']}/second, covering "
+                     f"the last {min(duration, (n + 1) * span):.0f}s. "
+                     f"Scroll left for earlier.")
+            if (n + 1) * span >= duration:
+                back_btn.configure(state="disabled")
+
+        def finish(action):
+            res["action"] = action
+            if action == "trim" and state["sel"] is not None:
+                res["time"] = loaded[state["sel"]][0]
+            elif action == "trim":
+                return
+            win.destroy()
+
+        win.bind("<Left>", lambda e: scroll(-6))
+        win.bind("<Right>", lambda e: scroll(6))
+        win.bind("<Escape>", lambda e: finish("skip"))
+        win.protocol("WM_DELETE_WINDOW", lambda: finish("skip"))
+        load_batch(0)
+        if not loaded:
+            win.destroy()
+            return ("skip", None)
+        win.grab_set()
+        root.wait_window(win)
+        return (res["action"], res["time"])
+
+    def fz_run_reviews(targets, conf):
+        """Main-thread pass over every clip that needs hand-trimming."""
+        box = fz["confirm"]
+        tmp_dir = Path(tempfile.mkdtemp(prefix="fcstudio_review_"))
+        try:
+            for n, plan in enumerate(targets, 1):
+                fz_status.set(f"Manual end review — {n} of {len(targets)}: "
+                              f"{plan['video'].name}")
+                action, t = fz_end_review(plan, conf, tmp_dir)
+                if action == "cancel":
+                    break
+                if action == "trim" and t is not None:
+                    plan["status"] = "trim"
+                    plan["cut"] = t
+                    plan["removed"] = max(0.0, plan["total"] - t)
+                    plan["msg"] = "end picked by hand"
+                    plan["out"] = Path(plan["out"]).with_suffix(".mp4")
+                    fz_upsert(plan)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            box["event"].set()
+
     def fz_work(videos, out_dir, conf):
         total = len(videos)
         workers = max(1, min(int(conf["workers"]), total))
@@ -1976,6 +3007,16 @@ def run_gui(preset_folder=None):
                     post("fz_status", "Cancelled after the preview. Nothing was written.")
                     post("fz_done", plans)
                     return
+
+            if conf.get("manual_end") and not fz["cancel"].is_set():
+                targets = [p for p in plans if p["status"] == "copy"]
+                if targets:
+                    post("fz_status", f"{len(targets)} clip(s) had no freeze — "
+                                      f"reviewing their endings by hand…")
+                    fz["confirm"]["event"].clear()
+                    post("fz_reviews", (targets, conf))
+                    fz["confirm"]["event"].wait()
+                    resolve_out_names(plans)
 
             todo = [p for p in plans if p["status"] in ("trim", "copy")]
             if not todo:
@@ -2036,6 +3077,7 @@ def run_gui(preset_folder=None):
                 f"{errors} error(s).")
             if not stopped:
                 fz_bar["value"] = 1000
+            auto_tidy()
         elif not fz_status.get().startswith("Cancelled"):
             fz_status.set(f"Nothing written{stopped}. {anomalies} anomalies, {errors} error(s).")
 
@@ -2064,6 +3106,8 @@ def run_gui(preset_folder=None):
                     fz_bar["value"] = payload * 1000
                 elif kind in ("fz_scanned", "fz_written"):
                     fz_upsert(payload)
+                elif kind == "fz_reviews":
+                    fz_run_reviews(*payload)
                 elif kind == "fz_done":
                     fz_finish(payload)
                 elif kind == "mp_status":
@@ -2076,6 +3120,16 @@ def run_gui(preset_folder=None):
                     mp_tree.insert("", "end", tags=(r["how"],),
                                    values=(r["file"], r["map"], r["how"], r["dest"]))
                     mp_tree.see(mp_tree.get_children()[-1])
+                elif kind == "mp_refs_built":
+                    if payload:
+                        mp["refs"] = payload
+                    mp_refs_label()
+                    mp_bar["value"] = 1000 if payload else 0
+                    if payload:
+                        m = payload["meta"]
+                        mp_status.set(f"Learned {m['maps']} map(s) from {m['clips']} "
+                                      f"clip(s). Try “Test accuracy…”.")
+                    mp_end()
                 elif kind == "mp_review":
                     mp["queue"] = payload
                     mp["idx"] = 0
@@ -2091,11 +3145,124 @@ def run_gui(preset_folder=None):
                             pass
                     if not mp_status.get().startswith(("Done", "Stopping")):
                         mp_status.set(mp_status.get())
+                elif kind == "footer":
+                    footer_note.set(payload)
                 elif kind == "fail":
                     messagebox.showerror(APP_NAME, payload)
         except queue.Empty:
             pass
         root.after(120, drain)
+
+    # ===================================================================== #
+    #                        footer: About / Clean up
+    # ===================================================================== #
+    def known_folders():
+        out = []
+        for v in (bp_folder.get(), fz_in.get(), fz_out.get(), mp_folder.get()):
+            v = (v or "").strip()
+            if v and Path(v).is_dir():
+                out.append(Path(v))
+        return out
+
+    def tidy_now(silent=False, include_snap_cache=True):
+        """Clear scratch left behind by a run. Never touches clips or output."""
+        items = find_junk(known_folders(), include_snap_cache=include_snap_cache)
+        if not items:
+            if not silent:
+                messagebox.showinfo(APP_NAME, "Nothing to clean up — no snapshot caches "
+                                              "or temporary files were found.")
+            return 0, 0
+        total = sum(i["bytes"] for i in items)
+        if not silent:
+            preview = "\n".join(f"   • {i['path'].name}  ({human_size(i['bytes'])})"
+                                for i in items[:12])
+            more = f"\n   … and {len(items) - 12} more" if len(items) > 12 else ""
+            if not messagebox.askyesno(
+                    APP_NAME,
+                    f"Remove {len(items)} item(s), freeing about {human_size(total)}?\n\n"
+                    f"{preview}{more}\n\nYour clips, originals and output files are not "
+                    f"touched."):
+                return 0, 0
+        removed, freed, failures = remove_junk(items)
+        if not silent:
+            msg = f"Removed {removed} item(s), freed {human_size(freed)}."
+            if failures:
+                msg += "\n\nCould not remove:\n   " + "\n   ".join(failures[:6])
+            messagebox.showinfo(APP_NAME, msg)
+        return removed, freed
+
+    def auto_tidy():
+        """Quiet sweep after a run: temp scratch only, snapshot caches left alone
+        because the Map Sorter uses them to resume."""
+        if not tidy_after.get():
+            return
+        if any(st["running"] for st in (bp, fz, mp)):
+            return          # another tab is still going; its scratch is in use
+        removed, freed = tidy_now(silent=True, include_snap_cache=False)
+        if removed:
+            post("footer", f"Tidied {removed} temporary item(s), {human_size(freed)} freed.")
+
+    def show_about():
+        win = tk.Toplevel(root)
+        win.title(f"About {APP_NAME}")
+        win.transient(root)
+        win.resizable(False, False)
+        pad = ttk.Frame(win, padding=20); pad.pack(fill="both", expand=True)
+        ttk.Label(pad, text="Fan Cave Studio PRO", font=("", 18, "bold")).pack(anchor="w")
+        ttk.Label(pad, text=f"Clip Toolkit   ·   version {APP_VERSION}",
+                  font=("", 12)).pack(anchor="w", pady=(0, 12))
+        ttk.Label(pad, text="Free to use.", font=("", 13, "bold")).pack(anchor="w")
+        ttk.Label(pad, justify="left", wraplength=460, foreground="#444",
+                  text="Released under the MIT licence — use it, change it, pass it on. "
+                       "Provided as is, with no warranty of any kind.").pack(
+            anchor="w", pady=(2, 14))
+
+        ttk.Label(pad, text="Support", font=("", 12, "bold")).pack(anchor="w")
+        mail = ttk.Frame(pad); mail.pack(anchor="w", fill="x", pady=(2, 14))
+        entry = ttk.Entry(mail, width=34)
+        entry.insert(0, SUPPORT_EMAIL)
+        entry.configure(state="readonly")
+        entry.pack(side="left")
+
+        def copy_mail():
+            root.clipboard_clear()
+            root.clipboard_append(SUPPORT_EMAIL)
+            copied.set("copied")
+        copied = tk.StringVar(value="")
+        ttk.Button(mail, text="Copy", command=copy_mail).pack(side="left", padx=6)
+        ttk.Label(mail, textvariable=copied, foreground="#1a7f37").pack(side="left")
+
+        ttk.Label(pad, text="Privacy", font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(pad, justify="left", wraplength=460, foreground="#444",
+                  text="This app makes no network connections and collects nothing. "
+                       "Your clips never leave this Mac. No account, no licence key, "
+                       "and it never needs administrator rights.").pack(
+            anchor="w", pady=(2, 14))
+
+        ttk.Label(pad, text="Built on", font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(pad, justify="left", wraplength=460, foreground="#444",
+                  text="ffmpeg for decoding and cutting, Apple's Vision framework for "
+                       "reading text on screen, and Python with tkinter for the window. "
+                       "ffmpeg is a separate program under its own licence.").pack(
+            anchor="w", pady=(2, 14))
+
+        ttk.Label(pad, justify="left", wraplength=460, foreground="#777", font=("", 10),
+                  text="Not affiliated with, endorsed by or connected to Activision, "
+                       "Treyarch or Sony. Call of Duty and Black Ops Cold War are "
+                       "trademarks of their respective owners. This is a personal tool "
+                       "for organising your own gameplay recordings.").pack(anchor="w")
+        ttk.Button(pad, text="Close", command=win.destroy).pack(anchor="e", pady=(16, 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
+
+    footer = ttk.Frame(root); footer.pack(fill="x", padx=10, pady=(0, 10))
+    ttk.Button(footer, text="About", command=show_about).pack(side="left")
+    ttk.Button(footer, text="Clean up…", command=lambda: tidy_now()).pack(side="left", padx=6)
+    tidy_after = tk.BooleanVar(value=True)
+    ttk.Checkbutton(footer, text="Tidy temporary files after each run",
+                    variable=tidy_after).pack(side="left", padx=10)
+    footer_note = tk.StringVar(value="")
+    ttk.Label(footer, textvariable=footer_note, foreground="#888").pack(side="right")
 
     def on_close():
         busy = [n for n, st in (("Best Play", bp), ("Freeze Tail", fz),
@@ -2117,6 +3284,9 @@ def run_gui(preset_folder=None):
     label = f"Reader: {probe.name}" if probe else "No text reader installed"
     bp_engine.set(label)
     mp_engine.set(label)
+    mp_load_refs()
+    if not mp_ref_root.get().strip() and mp_folder.get().strip():
+        mp_ref_root.set(mp_folder.get().strip())
     if not ffmpeg:
         for var in (bp_status, fz_status, mp_status):
             var.set("ffmpeg not found — run:  brew install ffmpeg")
