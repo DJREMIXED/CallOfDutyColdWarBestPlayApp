@@ -1,0 +1,28 @@
+# Fan Cave Studio PRO — Clip Toolkit
+# What the app itself needs at runtime.
+#
+# Versions are pinned on purpose. An unpinned install pulls whatever is newest
+# at build time, which means a bad or compromised upstream release reaches your
+# users without anyone deciding to let it in. Pinning makes that a decision.
+#
+# To move to newer versions:
+#   1. bump the numbers below
+#   2. rebuild and run the tests
+#   3. commit the change, so there is a record of when the versions moved
+#
+# Or, for a one-off build against the latest of everything:
+#   ./build_mac_studio.command --latest
+#
+# Last reviewed: 2026-08-30
+
+# --- Freeze Tail: frame comparison ---
+numpy==2.5.2
+
+# --- Best Play and Map Sorter: Apple Vision text recognition ---
+pyobjc-framework-Vision==12.2.2
+pyobjc-framework-Quartz==12.2.2
+
+# Pulled in by the two above. Pinned as well so the whole tree is fixed.
+pyobjc-core==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-CoreML==12.2.2
