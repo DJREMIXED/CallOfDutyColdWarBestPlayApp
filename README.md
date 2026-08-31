@@ -7,11 +7,12 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
-<img width="1244" height="860" alt="Screenshot 2026-08-30 at 8 41 07 PM" src="https://github.com/user-attachments/assets/7ba638bc-1282-47fc-92fb-361b8efa9663" />
+<img width="1244" height="860" alt="Screenshot 2026-08-30 at 8 41 07 PM" src="https://github.com/user-attachments/assets/6f37fb0a-4582-456f-95c4-043a6594bbc2" />
 
-<img width="1236" height="857" alt="Screenshot 2026-08-30 at 8 41 35 PM" src="https://github.com/user-attachments/assets/c6182b7a-1c30-4bf1-b4cb-7a65db5376ac" />
+<img width="1236" height="857" alt="Screenshot 2026-08-30 at 8 41 35 PM" src="https://github.com/user-attachments/assets/af15bd0b-2c2a-4bd6-808d-0e1a2ed9bd56" />
 
-<img width="1228" height="852" alt="Screenshot 2026-08-30 at 8 56 07 PM" src="https://github.com/user-attachments/assets/65929553-770c-47ac-96a4-282a2b170ecc" />
+<img width="1228" height="852" alt="Screenshot 2026-08-30 at 8 56 07 PM" src="https://github.com/user-attachments/assets/41bab4a2-6e56-43e3-81ea-83cf1f264aa6" />
+
 
 
 If you record on a PlayStation 5, you end up with a folder of long captures where the
