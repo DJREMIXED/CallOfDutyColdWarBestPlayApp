@@ -5,6 +5,10 @@
 # One app, three tabs: Best Play, Freeze Tail and Map Sorter.
 # Prereqs (one time):  brew install ffmpeg python-tk
 # Then double-click this file. Finished app: dist/FanCaveStudio.app
+#
+# Dependencies come from requirements.txt and requirements-build.txt, pinned to
+# known-good versions. To build against the newest of everything instead:
+#     ./build_mac_studio.command --latest
 # ============================================================================
 set -Eeo pipefail   # no -u: some venv activate scripts read unset vars
 cd "$(dirname "$0")"
@@ -12,6 +16,19 @@ cd "$(dirname "$0")"
 APP_NAME="FanCaveStudio"
 BUNDLE_ID="com.fancavestudio.cliptoolkit"
 VENV=".buildenv_studio"
+
+USE_LATEST=0
+for arg in "$@"; do
+  case "$arg" in
+    --latest) USE_LATEST=1 ;;
+    -h|--help)
+      echo "Usage: ./build_mac_studio.command [--latest]"
+      echo "  (no flags)  build against the pinned versions in requirements*.txt"
+      echo "  --latest    ignore the pins and install the newest releases"
+      exit 0 ;;
+    *) echo "Unknown option: $arg  (try --help)"; exit 2 ;;
+  esac
+done
 
 pause() { echo ""; read -n 1 -s -r -p "Press any key to close."; echo ""; }
 
@@ -50,17 +67,37 @@ if [ ! -f "fan_cave_studio.py" ]; then
   pause; exit 1
 fi
 
+if [ "$USE_LATEST" -eq 0 ]; then
+  for req in requirements.txt requirements-build.txt; do
+    if [ ! -f "$req" ]; then
+      echo "!! $req is missing. Download it alongside the other files, or run"
+      echo "   ./build_mac_studio.command --latest to build without the pins."
+      pause; exit 1
+    fi
+  done
+fi
+
 echo ">> Creating build environment…"
 python3 -m venv "$VENV"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 python -m pip install --upgrade pip >/dev/null
 
-echo ">> Installing numpy (Freeze Tail) and Apple Vision bindings (Best Play, Map Sorter)…"
-python -m pip install --upgrade numpy pyobjc-framework-Vision pyobjc-framework-Quartz
+if [ "$USE_LATEST" -eq 1 ]; then
+  echo ">> --latest: ignoring the pinned versions."
+  echo ">> Installing numpy (Freeze Tail) and Apple Vision bindings (Best Play, Map Sorter)…"
+  python -m pip install --upgrade numpy pyobjc-framework-Vision pyobjc-framework-Quartz
+  echo ">> Installing PyInstaller…"
+  python -m pip install --upgrade pyinstaller
+else
+  echo ">> Installing pinned runtime packages (requirements.txt)…"
+  python -m pip install -r requirements.txt
+  echo ">> Installing pinned build tools (requirements-build.txt)…"
+  python -m pip install -r requirements-build.txt
+fi
 
-echo ">> Installing PyInstaller…"
-python -m pip install --upgrade pyinstaller
+echo ">> Installed into $VENV:"
+python -m pip list --format=freeze | sed 's/^/     /'
 
 python - <<'PY'
 import sys
