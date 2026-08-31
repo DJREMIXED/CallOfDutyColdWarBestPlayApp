@@ -1,0 +1,23 @@
+# Build output from build_mac_studio.command
+.buildenv_studio/
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+._*
+
+# Anything you drop in the repo folder to try the app on
+*.mp4
+*.mov
+*.mkv
+_mapsort_snaps_*/
+BEST_PLAYS/
+NO_BEST_PLAY/
+_PROCESSED/
+*_report.csv
