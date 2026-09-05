@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 """
 fan_cave_studio.py  (macOS / Apple Silicon)
 ===========================================
